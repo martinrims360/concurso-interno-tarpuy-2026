@@ -800,8 +800,55 @@ async function resultadosPublicados() {
   return r.rows.length > 0 && r.rows[0].valor === '1';
 }
 
-// Público: todos los inscritos (sin puntaje = "No rindió"). Solo nombre, grado,
-// categoría, puntaje y hora: sin DNI ni celular.
+// ---- Ranking (misma regla que la página): mayor puntaje; en empate, menor hora ----
+const catKeyS = (c) =>
+  /LEIBNIZ|[“"]A[”"]/i.test(c || '') ? 'A' : /GAUSS|[“"]B[”"]/i.test(c || '') ? 'B' : '';
+
+const horaOrden = (h) => h || '99:99:99';
+
+function rankear(lista) {
+  const a = [...lista].sort(
+    (x, y) =>
+      y.puntaje - x.puntaje ||
+      horaOrden(x.hora).localeCompare(horaOrden(y.hora)) ||
+      x.nombre.localeCompare(y.nombre, 'es')
+  );
+
+  a.forEach((r, i) => {
+    const p = a[i - 1];
+    r.merito =
+      !p || p.puntaje !== r.puntaje || horaOrden(p.hora) !== horaOrden(r.hora)
+        ? i + 1
+        : p.merito;
+  });
+
+  return a;
+}
+
+async function cargarAlumnosResultados() {
+  const r = await pool.query(
+    `SELECT dni, nombre, grado, nivel, categoria, puntaje,
+            to_char(hora_entrega, 'HH24:MI:SS') AS hora
+     FROM libres`
+  );
+
+  return r.rows.map((x) => ({
+    dni: x.dni,
+    nombre: x.nombre,
+    grado: x.grado,
+    nivel: x.nivel,
+    categoria: x.categoria || '',
+    cat: catKeyS(x.categoria),
+    puntaje: x.puntaje === null ? null : Number(x.puntaje),
+    hora: x.hora || ''
+  }));
+}
+
+const NIVELES = ['Inicial', 'Primaria', 'Secundaria'];
+
+// Público: solo los 5 primeros puestos de cada nivel y categoría, más los
+// totales por grado (para Interaulas). El resto de alumnos NO se envía:
+// se consulta uno por uno con /api/resultados/buscar.
 app.get('/api/resultados', wrap(async (req, res) => {
   res.set('Cache-Control', 'no-store');
 
@@ -809,27 +856,134 @@ app.get('/api/resultados', wrap(async (req, res) => {
   const admin = isAdmin(req);
 
   if (!publicado && !admin) {
-    return res.json({ publicado: false, vistaPrevia: false, items: [] });
+    return res.json({ publicado: false, vistaPrevia: false, items: [], aulas: [] });
   }
 
-  const r = await pool.query(
-    `SELECT nombre, grado, nivel, categoria, puntaje,
-            to_char(hora_entrega, 'HH24:MI:SS') AS hora
-     FROM libres`
-  );
+  const todos = await cargarAlumnosResultados();
+  const items = [];
+
+  for (const nivel of NIVELES) {
+    for (const cat of ['A', 'B']) {
+      const grupo = todos.filter(
+        (x) => x.puntaje !== null && x.nivel === nivel && x.cat === cat
+      );
+
+      rankear(grupo)
+        .filter((x) => x.merito <= 5)
+        .forEach((x) =>
+          items.push({
+            nombre: x.nombre,
+            grado: x.grado,
+            nivel: x.nivel,
+            categoria: x.categoria,
+            puntaje: x.puntaje,
+            hora: x.hora
+          })
+        );
+    }
+  }
+
+  const porGrado = {};
+
+  todos
+    .filter((x) => x.puntaje !== null)
+    .forEach((x) => {
+      const g = (porGrado[x.grado] = porGrado[x.grado] || { grado: x.grado, n: 0, suma: 0 });
+      g.n += 1;
+      g.suma += x.puntaje;
+    });
 
   res.json({
     publicado,
     vistaPrevia: !publicado && admin,
-    items: r.rows.map((x) => ({
-      nombre: x.nombre,
-      grado: x.grado,
-      nivel: x.nivel,
-      categoria: x.categoria || '',
-      puntaje: x.puntaje === null ? null : Number(x.puntaje),
-      hora: x.hora || ''
-    }))
+    items,
+    aulas: Object.values(porGrado)
   });
+}));
+
+// ---- Búsqueda personal: por DNI exacto o por apellidos y nombres ----
+const buscarLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 25,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Demasiadas búsquedas seguidas. Espera un minuto e inténtalo otra vez.'
+  }
+});
+
+const normTexto = (s) =>
+  String(s || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+app.get('/api/resultados/buscar', buscarLimiter, wrap(async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+
+  const publicado = await resultadosPublicados();
+
+  if (!publicado && !isAdmin(req)) {
+    return res.json({ resultados: [], noPublicado: true });
+  }
+
+  const q = clean(req.query.q, 80);
+  const soloDigitos = q.replace(/\s/g, '');
+  const esDni = /^\d+$/.test(soloDigitos);
+
+  if (esDni && soloDigitos.length !== 8) {
+    throw bad('El DNI debe tener 8 dígitos.');
+  }
+
+  const tokens = normTexto(q).split(' ').filter(Boolean);
+
+  if (!esDni && (tokens.length < 2 || tokens.join('').length < 5)) {
+    throw bad('Escribe al menos dos palabras: apellidos y nombres del alumno.');
+  }
+
+  const todos = await cargarAlumnosResultados();
+
+  const coincide = (x) => {
+    if (esDni) return x.dni === soloDigitos;
+
+    const palabras = normTexto(x.nombre).split(' ');
+
+    return tokens.every((tk) => palabras.some((w) => w.startsWith(tk)));
+  };
+
+  const encontrados = todos.filter(coincide).slice(0, 8);
+
+  const resultados = encontrados.map((x) => {
+    const base = { nombre: x.nombre, grado: x.grado, nivel: x.nivel, cat: x.cat };
+
+    if (x.puntaje === null) {
+      return { ...base, puntaje: null, hora: '', max: PUNTAJE_MAX[x.nivel] ?? 150 };
+    }
+
+    const enNivel = rankear(
+      todos.filter((y) => y.puntaje !== null && y.nivel === x.nivel && y.cat === x.cat)
+    );
+    const enGrado = rankear(
+      todos.filter((y) => y.puntaje !== null && y.grado === x.grado && y.cat === x.cat)
+    );
+    const yo = (lista) => lista.find((y) => y.dni === x.dni);
+
+    return {
+      ...base,
+      puntaje: x.puntaje,
+      hora: x.hora,
+      max: PUNTAJE_MAX[x.nivel] ?? 150,
+      meritoNivel: yo(enNivel).merito,
+      totalNivel: enNivel.length,
+      meritoGrado: yo(enGrado).merito,
+      totalGrado: enGrado.length
+    };
+  });
+
+  res.json({ resultados });
 }));
 
 app.get('/api/admin/publicado', needAdmin, wrap(async (_req, res) => {
