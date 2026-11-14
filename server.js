@@ -844,9 +844,7 @@ async function cargarAlumnosResultados() {
   }));
 }
 
-const NIVELES = ['Inicial', 'Primaria', 'Secundaria'];
-
-// Público: solo los 5 primeros puestos de cada nivel y categoría, más los
+// Público: solo los 5 primeros puestos de cada grado y categoría, más los
 // totales por grado (para Interaulas). El resto de alumnos NO se envía:
 // se consulta uno por uno con /api/resultados/buscar.
 app.get('/api/resultados', wrap(async (req, res) => {
@@ -862,10 +860,10 @@ app.get('/api/resultados', wrap(async (req, res) => {
   const todos = await cargarAlumnosResultados();
   const items = [];
 
-  for (const nivel of NIVELES) {
+  for (const grado of [...new Set(todos.map((x) => x.grado))]) {
     for (const cat of ['A', 'B']) {
       const grupo = todos.filter(
-        (x) => x.puntaje !== null && x.nivel === nivel && x.cat === cat
+        (x) => x.puntaje !== null && x.grado === grado && x.cat === cat
       );
 
       rankear(grupo)
